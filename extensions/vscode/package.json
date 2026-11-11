@@ -1,0 +1,180 @@
+{
+  "name": "kuibysheff-1c",
+  "displayName": "Kuibysheff 1C Agents",
+  "description": "Manage Kuibysheff agent parameters and 1C ACP workflow in VS Code",
+  "version": "0.1.0",
+  "publisher": "kuibysheff",
+  "icon": "media/kuibyshev-app-icon.png",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/gazalievtimur/Agent-Kuibysheff.git",
+    "directory": "extensions/vscode"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "workspaceContains:.kuibysheff",
+    "onView:kuibysheff.agents",
+    "onCommand:kuibysheff.scaffold"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "kuibysheff",
+          "title": "Kuibysheff",
+          "icon": "media/kuibyshev-app-icon.png"
+        }
+      ]
+    },
+    "views": {
+      "kuibysheff": [
+        {
+          "id": "kuibysheff.agents",
+          "name": "Agents & Workflow"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "kuibysheff.scaffold",
+        "title": "Kuibysheff: Scaffold project",
+        "icon": "$(new-folder)"
+      },
+      {
+        "command": "kuibysheff.refresh",
+        "title": "Kuibysheff: Refresh",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "kuibysheff.editAgent",
+        "title": "Kuibysheff: Edit agent config",
+        "icon": "$(settings-gear)"
+      },
+      {
+        "command": "kuibysheff.openYaml",
+        "title": "Kuibysheff: Open agent YAML"
+      },
+      {
+        "command": "kuibysheff.check",
+        "title": "Kuibysheff: Check agent config",
+        "icon": "$(check)"
+      },
+      {
+        "command": "kuibysheff.syncAcp",
+        "title": "Kuibysheff: Sync ACP agents"
+      },
+      {
+        "command": "kuibysheff.prepare",
+        "title": "Kuibysheff: Prepare stage",
+        "icon": "$(play)"
+      },
+      {
+        "command": "kuibysheff.promote",
+        "title": "Kuibysheff: Promote stage out"
+      },
+      {
+        "command": "kuibysheff.validate",
+        "title": "Kuibysheff: Validate stage"
+      },
+      {
+        "command": "kuibysheff.promoteAndValidate",
+        "title": "Kuibysheff: Promote and validate"
+      },
+      {
+        "command": "kuibysheff.approvePlan",
+        "title": "Kuibysheff: Approve plan",
+        "icon": "$(pass)"
+      },
+      {
+        "command": "kuibysheff.copyChatStarter",
+        "title": "Kuibysheff: Copy chat starter"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "kuibysheff.refresh",
+          "when": "view == kuibysheff.agents",
+          "group": "navigation"
+        },
+        {
+          "command": "kuibysheff.scaffold",
+          "when": "view == kuibysheff.agents",
+          "group": "navigation"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "kuibysheff.editAgent",
+          "when": "view == kuibysheff.agents && viewItem == agent",
+          "group": "inline"
+        },
+        {
+          "command": "kuibysheff.check",
+          "when": "view == kuibysheff.agents && viewItem == agent",
+          "group": "1_actions"
+        },
+        {
+          "command": "kuibysheff.openYaml",
+          "when": "view == kuibysheff.agents && viewItem == agent",
+          "group": "1_actions"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "kuibysheff.editAgent"
+        },
+        {
+          "command": "kuibysheff.openYaml"
+        },
+        {
+          "command": "kuibysheff.check"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Kuibysheff",
+      "properties": {
+        "kuibysheff.repoRoot": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Absolute path to the **Agent Kuibysheff** install (the clone that contains `scripts/1c-dev-scaffold-project.ps1`), **not** the 1C product folder opened as the workspace. Example: `C:\\\\Git\\\\Agent Kuibysheff`."
+        },
+        "kuibysheff.binaryPath": {
+          "type": "string",
+          "default": "kbshff",
+          "description": "Path or name of the kbshff binary."
+        },
+        "kuibysheff.defaultIssueKey": {
+          "type": "string",
+          "default": "",
+          "description": "Default Jira issue key for Prepare stage."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "node esbuild.mjs",
+    "watch": "node esbuild.mjs --watch",
+    "test": "node --test test/*.test.mjs",
+    "vscode:prepublish": "npm run compile",
+    "package": "vsce package --no-dependencies"
+  },
+  "dependencies": {
+    "js-yaml": "^5.5.0"
+  },
+  "devDependencies": {
+    "@types/js-yaml": "^4.0.9",
+    "@types/node": "^26.6.5",
+    "@types/vscode": "^1.140.0",
+    "esbuild": "^0.28.2",
+    "typescript": "^7.0.2"
+  }
+}

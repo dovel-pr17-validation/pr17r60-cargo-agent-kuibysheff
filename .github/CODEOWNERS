@@ -1,0 +1,12 @@
+# CODEOWNERS — default reviewers for sensitive paths
+# https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+* @gazalievtimur
+
+/src/ @gazalievtimur
+/crates/sandbox-linux/ @gazalievtimur
+/crates/sandbox-windows/ @gazalievtimur
+/.github/workflows/ @gazalievtimur
+/SECURITY.md @gazalievtimur
+/deny.toml @gazalievtimur
+/workflows/security-sandbox/ @gazalievtimur

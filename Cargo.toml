@@ -1,0 +1,89 @@
+[workspace]
+resolver = "2"
+members = [".", "crates/sandbox-linux", "crates/sandbox-windows", "crates/kbshff-studio"]
+
+[workspace.dependencies]
+sandbox-linux = { path = "crates/sandbox-linux" }
+sandbox-windows = { path = "crates/sandbox-windows" }
+thiserror = "2"
+serde = "1"
+serde_json = { version = "1", features = ["arbitrary_precision"] }
+tempfile = "3"
+libc = "0.2"
+windows-sys = "0.61"
+
+[package]
+name = "agent_Kuibysheff"
+version = "0.3.1"
+edition = "2021"
+rust-version = "1.88"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+a2a = { package = "a2a-lf", version = "0.3" }
+a2a-server = { package = "a2a-server-lf", version = "0.4", default-features = false }
+agent-client-protocol = { version = "3", features = ["stdio"] }
+anyhow = "1"
+async-trait = "0.1"
+axum = { version = "0.8", default-features = false, features = ["json", "tokio", "http1"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+clap = { version = "4", features = ["derive"] }
+futures = "0.3"
+rand = "0.10"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+serde = { workspace = true, features = ["derive", "rc"] }
+serde_json = { workspace = true }
+serde_yaml = "0.9"
+dotenvy = "0.15"
+thiserror = { workspace = true }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "io-util", "time", "fs", "sync", "net", "signal"] }
+subtle = "2"
+tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+tower = { version = "0.5", default-features = false, features = ["util"] }
+url = "2"
+sha2 = "0.11"
+base64 = "0.23"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+sandbox-linux = { workspace = true }
+rust_decimal = { version = "1.42.1", features = ["serde"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+sandbox-windows = { workspace = true }
+
+[dev-dependencies]
+a2a-client = { package = "a2a-client-lf", version = "0.2", default-features = false }
+# Same reqwest tree as a2a-client-lf; lets tests hand it a no-proxy client.
+reqwest13 = { package = "reqwest", version = "0.13", default-features = false, features = ["json"] }
+tempfile = { workspace = true }
+wiremock = "0.6"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+# Keep the agent crate actionable under `-D warnings` without drowning in pedantic noise.
+pedantic = { level = "allow", priority = -1 }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+
+[[bin]]
+name = "kbshff"
+path = "src/main.rs"
+
+[[bin]]
+name = "sandbox_e2e_fixture"
+path = "src/bin/sandbox_e2e_fixture.rs"
+
+[[bin]]
+name = "mcp_stdio_fixture"
+path = "src/bin/mcp_stdio_fixture.rs"

@@ -1,0 +1,82 @@
+# Rust
+/target/
+
+# Runtime logs and demo output
+/logs/
+/demo-home/out/
+/demo-home/searxng/out/
+/run/out/
+
+# Python bytecode
+**/__pycache__/
+*.py[cod]
+
+# Local secrets and overrides
+.env
+.env.*
+!.env.example
+agent-config.local.yaml
+# Provider-bound local AoC configs (keep *.aoc.example.yaml tracked)
+**/agent-config.aoc.yaml
+
+# IDE local MCP (keep mcp.json.example tracked)
+.cursor/mcp.json
+
+# Optional local Cursor skills (not vendored in this repo)
+.cursor/skills/
+
+# Local Cursor plans (may contain machine paths / internal notes)
+.cursor/plans/
+
+# Local LLM regression reports (not committed)
+/deepseek__*.json
+
+# Example / eval copy-units (local testing only; not part of the product tree)
+/workflows/
+
+# AoC eval data and run artifacts (not committed)
+/local/aoc-bank/
+/local/aoc-runs/
+/local/aoc-sandbox-runtime/
+/local/aoc-live-project/
+/local/security-bank/
+/local/security-runs/
+/local/security-host-canary/
+
+# Scale-FS live regression (working banks / runs)
+/local/scale-fs-bank/
+/local/scale-fs-runs/
+/local/scale-fs-sandbox-runtime/
+
+# A2A live regression (working banks / runs)
+/local/a2a-bank/
+/local/a2a-runs/
+
+# Event-MCP live regression (working banks / runs)
+/local/event-mcp-bank/
+/local/event-mcp-runs/
+
+# Local secret-scan reports (not committed)
+/local/gitleaks-report.json
+
+# Local test-run logs from integration / live harnesses
+/local/test-run-*.log
+
+# Local RAG index cache (not source)
+/build/rag/
+
+# Agent home run artifacts (manifest/summary under homes/*/out)
+.kuibysheff/homes/*/out/
+
+# Local code-index cache (not source)
+src/.code-index/
+
+# Slopo local DB and analysis reports (config + ignore list are committed)
+/slopo.db
+/slopo-report/
+
+# IDE / OS
+.idea/
+*.swp
+Thumbs.db
+Desktop.ini

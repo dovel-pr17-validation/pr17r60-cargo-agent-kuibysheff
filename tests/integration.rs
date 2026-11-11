@@ -1,0 +1,786 @@
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::path::Path;
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use tokio::sync::Mutex;
+
+use agent_Kuibysheff::access::{
+    CanonicalRoot, EffectiveToolPolicy, HomeFsPolicy, ProgramAlias, QualifiedTool,
+    ResolvedAccessPolicy, ResolvedProgramPolicy, WorkspaceFsPolicy,
+};
+use agent_Kuibysheff::agent::{AgentEngine, AgentRunRequest, RunCancel};
+use agent_Kuibysheff::billing::{
+    parse_decimal, BillableMetric, BudgetStatus, CostResolverChain, Money,
+    ProviderAttemptAccounting, ProviderReportedCostResolver, ReportedCost,
+};
+use agent_Kuibysheff::config::{LogSinkConfig, LoggingConfig};
+use agent_Kuibysheff::limits::{LimitsConfig, TokenUsage};
+use agent_Kuibysheff::logging::Loggers;
+use agent_Kuibysheff::output::StopReason;
+use agent_Kuibysheff::provider::{
+    AccountedModelResponse, AccountedProviderError, ChatMessage, Error as ProviderError,
+    ModelClient, ModelResponse,
+};
+use agent_Kuibysheff::tool_api::ToolExecutor;
+use agent_Kuibysheff::tools::fs_home::HomeFs;
+use agent_Kuibysheff::tools::local_tools::LocalTools;
+use agent_Kuibysheff::tools::ToolError;
+use agent_Kuibysheff::tools::{CompositeToolExecutor, PolicyToolExecutor};
+
+struct FakeModel {
+    responses: Mutex<VecDeque<ModelResponse>>,
+}
+
+struct PricedModel {
+    response: Mutex<Option<ModelResponse>>,
+}
+
+#[async_trait]
+impl ModelClient for PricedModel {
+    async fn complete(&self, _messages: &[ChatMessage]) -> Result<ModelResponse, ProviderError> {
+        self.response
+            .lock()
+            .await
+            .take()
+            .ok_or(ProviderError::EmptyChoices)
+    }
+
+    async fn complete_accounted(
+        &self,
+        _messages: &[ChatMessage],
+    ) -> Result<AccountedModelResponse, AccountedProviderError> {
+        let response = self
+            .response
+            .lock()
+            .await
+            .take()
+            .ok_or_else(|| AccountedProviderError {
+                error: ProviderError::EmptyChoices,
+                attempts: Vec::new(),
+            })?;
+        let usage = response.usage;
+        Ok(AccountedModelResponse {
+            response,
+            attempts: vec![ProviderAttemptAccounting {
+                attempt: 1,
+                provider_id: "fixture".to_string(),
+                requested_model: "cheap".to_string(),
+                resolved_model: None,
+                service_tier: None,
+                request_id: Some("req-priced".to_string()),
+                http_status: Some(200),
+                occurred_at_ms: 1,
+                usage_reported: true,
+                usage,
+                billable_metrics: BTreeMap::from([
+                    (BillableMetric::InputTokens, usage.prompt_tokens),
+                    (BillableMetric::OutputTokens, usage.completion_tokens),
+                ]),
+                reported_cost: Some(ReportedCost {
+                    amount: parse_decimal("0.00000894").expect("decimal"),
+                    unit: Some("USD".to_string()),
+                    source: "provider_fixture".to_string(),
+                    details: BTreeMap::new(),
+                }),
+                error: None,
+            }],
+        })
+    }
+}
+
+#[async_trait]
+impl ModelClient for FakeModel {
+    async fn complete(&self, _messages: &[ChatMessage]) -> Result<ModelResponse, ProviderError> {
+        let mut guard = self.responses.lock().await;
+        guard.pop_front().ok_or(ProviderError::EmptyChoices)
+    }
+}
+
+struct FakeTools;
+
+#[async_trait]
+impl ToolExecutor for FakeTools {
+    async fn call_tool(
+        &self,
+        _server: &str,
+        _tool: &str,
+        _arguments: serde_json::Value,
+    ) -> Result<serde_json::Value, ToolError> {
+        Ok(serde_json::json!({"ok": true}))
+    }
+
+    fn available_tools(&self) -> Vec<String> {
+        vec!["local.echo".to_string()]
+    }
+}
+
+fn request(prompt: &str, limits: LimitsConfig) -> AgentRunRequest {
+    AgentRunRequest {
+        prompt: prompt.to_string(),
+        system_prompt: "system".to_string(),
+        input_files_context: String::new(),
+        limits,
+        history: agent_Kuibysheff::config::ProviderHistoryConfig::default(),
+        cancel: RunCancel::new(),
+        events: agent_Kuibysheff::agent::AgentEventTx::noop(),
+        home: std::path::PathBuf::new(),
+        pinned_files: Vec::new(),
+        resume_messages: None,
+    }
+}
+
+fn priced_engine(response: ModelResponse) -> AgentEngine {
+    let resolver = ProviderReportedCostResolver::new("USD", Some("USD".to_string()))
+        .expect("reported resolver");
+    AgentEngine::new(
+        Arc::new(PricedModel {
+            response: Mutex::new(Some(response)),
+        }),
+        Arc::new(FakeTools),
+        Loggers::default(),
+    )
+    .with_billing(
+        Arc::new(CostResolverChain::new(vec![Arc::new(resolver)])),
+        "USD",
+        "run-priced",
+    )
+}
+
+async fn make_tools_with_runner(
+    dir: &Path,
+    home_policy: HomeFsPolicy,
+    runner: Arc<agent_Kuibysheff::sandbox::SandboxRunner>,
+) -> Arc<CompositeToolExecutor> {
+    let home = HomeFs::new(dir, home_policy, runner, RunCancel::new())
+        .await
+        .expect("home");
+    let local_tools = LocalTools::new(dir, WorkspaceFsPolicy::legacy())
+        .await
+        .expect("local tools");
+    Arc::new(CompositeToolExecutor::new(
+        home,
+        local_tools,
+        Arc::new(FakeTools),
+    ))
+}
+
+async fn make_legacy_tools(dir: &Path) -> Arc<CompositeToolExecutor> {
+    make_tools_with_runner(
+        dir,
+        HomeFsPolicy::legacy(),
+        Arc::new(agent_Kuibysheff::sandbox::SandboxRunner::platform_default()),
+    )
+    .await
+}
+
+fn policy_executor_for(
+    composite: Arc<CompositeToolExecutor>,
+    access: &ResolvedAccessPolicy,
+    tools: &[&str],
+) -> Arc<PolicyToolExecutor> {
+    let allowed: BTreeSet<QualifiedTool> = tools
+        .iter()
+        .map(|tool| QualifiedTool::parse(tool).expect("valid tool"))
+        .collect();
+    let policy = EffectiveToolPolicy::compile(access, &allowed, BTreeSet::new());
+    Arc::new(PolicyToolExecutor::new(composite, policy))
+}
+
+fn home_policy_with_program(alias: &str, exe: &Path) -> HomeFsPolicy {
+    let mut home_policy = HomeFsPolicy::legacy();
+    let executable = CanonicalRoot::canonicalize(exe).expect("canonicalize");
+    let mut programs = BTreeMap::new();
+    programs.insert(
+        ProgramAlias::parse(alias).unwrap(),
+        ResolvedProgramPolicy {
+            alias: ProgramAlias::parse(alias).unwrap(),
+            executable,
+            runtime_read_roots: Vec::new(),
+            inherit_env: Vec::new(),
+            allow_children: false,
+        },
+    );
+    home_policy.programs = programs;
+    home_policy
+}
+
+fn prepare_fixture_exe(dir: &Path) -> std::path::PathBuf {
+    let fixture = std::path::PathBuf::from(env!("CARGO_BIN_EXE_sandbox_e2e_fixture"));
+    #[cfg(windows)]
+    let local_exe = dir.join("sandbox_e2e_fixture.exe");
+    #[cfg(not(windows))]
+    let local_exe = dir.join("sandbox_e2e_fixture");
+    std::fs::copy(&fixture, &local_exe).expect("copy fixture");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&local_exe).expect("meta").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&local_exe, perms).expect("chmod");
+    }
+    local_exe
+}
+
+#[tokio::test]
+async fn run_finishes_when_model_marks_done() {
+    let model = FakeModel {
+        responses: Mutex::new(VecDeque::from(vec![ModelResponse {
+            content: r#"{"done":true,"thought":"done","tool_calls":[],"result":"task completed"}"#
+                .to_string(),
+            usage: TokenUsage {
+                prompt_tokens: 4,
+                completion_tokens: 3,
+                total_tokens: 7,
+            },
+        }])),
+    };
+
+    let engine = AgentEngine::new(Arc::new(model), Arc::new(FakeTools), Loggers::default());
+    let output = engine
+        .run(request(
+            "finish",
+            LimitsConfig {
+                max_iterations: 3,
+                max_tokens: 100,
+                max_duration_sec: 60,
+                max_cost: None,
+            },
+        ))
+        .await;
+
+    assert_eq!(output.stop_reason, StopReason::GoalReached);
+    assert_eq!(output.result, "task completed");
+    assert_eq!(output.usage.iterations, 1);
+    assert_eq!(output.usage.total_tokens, 7);
+}
+
+#[tokio::test]
+async fn final_output_contains_exact_per_request_cost() {
+    let engine = priced_engine(ModelResponse {
+        content: r#"{"done":true,"thought":"done","tool_calls":[],"result":"priced"}"#.to_string(),
+        usage: TokenUsage {
+            prompt_tokens: 4,
+            completion_tokens: 3,
+            total_tokens: 7,
+        },
+    });
+    let output = engine
+        .run(request(
+            "priced",
+            LimitsConfig {
+                max_iterations: 3,
+                max_tokens: 100,
+                max_duration_sec: 60,
+                max_cost: None,
+            },
+        ))
+        .await;
+
+    assert_eq!(output.run_id, "run-priced");
+    assert_eq!(
+        output
+            .usage
+            .cost
+            .known_total
+            .as_ref()
+            .expect("known total")
+            .amount()
+            .to_string(),
+        "0.00000894"
+    );
+    assert_eq!(output.usage.cost.requests.len(), 1);
+    assert_eq!(
+        output.usage.cost.requests[0]
+            .amount
+            .as_ref()
+            .expect("request amount")
+            .amount()
+            .to_string(),
+        "0.00000894"
+    );
+}
+
+#[tokio::test]
+async fn max_cost_stops_after_charged_request() {
+    let engine = priced_engine(ModelResponse {
+        content: r#"{"done":false,"thought":"continue","tool_calls":[],"result":null}"#.to_string(),
+        usage: TokenUsage {
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            total_tokens: 2,
+        },
+    });
+    let output = engine
+        .run(request(
+            "priced",
+            LimitsConfig {
+                max_iterations: 3,
+                max_tokens: 100,
+                max_duration_sec: 60,
+                max_cost: Some(Money::parse("0.00000894", "USD").expect("limit")),
+            },
+        ))
+        .await;
+
+    assert_eq!(output.stop_reason, StopReason::LimitReached);
+    assert!(output.result.contains("max_cost"), "{}", output.result);
+    assert_eq!(output.usage.cost.budget_status, BudgetStatus::LimitReached);
+}
+
+#[tokio::test]
+async fn engine_emits_thought_message_and_tool_events() {
+    let model = FakeModel {
+        responses: Mutex::new(VecDeque::from(vec![
+            ModelResponse {
+                content: r#"{"done":false,"thought":"call echo","tool_calls":[{"server":"local","tool":"echo","arguments":{"x":1}}],"result":null}"#
+                    .to_string(),
+                usage: TokenUsage {
+                    prompt_tokens: 1,
+                    completion_tokens: 1,
+                    total_tokens: 2,
+                },
+            },
+            ModelResponse {
+                content: r#"{"done":true,"thought":"done","tool_calls":[],"result":"ok"}"#
+                    .to_string(),
+                usage: TokenUsage {
+                    prompt_tokens: 1,
+                    completion_tokens: 1,
+                    total_tokens: 2,
+                },
+            },
+        ])),
+    };
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut req = request(
+        "emit",
+        LimitsConfig {
+            max_iterations: 5,
+            max_tokens: 100,
+            max_duration_sec: 60,
+            max_cost: None,
+        },
+    );
+    req.events = agent_Kuibysheff::agent::AgentEventTx::from_sender(tx);
+
+    let engine = AgentEngine::new(Arc::new(model), Arc::new(FakeTools), Loggers::default());
+    let output = engine.run(req).await;
+    assert_eq!(output.stop_reason, StopReason::GoalReached);
+
+    let mut events = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        events.push(event);
+    }
+
+    assert!(
+        events.iter().any(
+            |e| matches!(e, agent_Kuibysheff::agent::AgentEvent::Thought(t) if t == "call echo")
+        ),
+        "missing thought: {events:?}"
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            agent_Kuibysheff::agent::AgentEvent::ToolStart { tool, .. } if tool == "echo"
+        )),
+        "missing tool start: {events:?}"
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            agent_Kuibysheff::agent::AgentEvent::ToolFinish { ok: true, .. }
+        )),
+        "missing tool finish: {events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, agent_Kuibysheff::agent::AgentEvent::Message(m) if m == "ok")),
+        "missing message: {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn run_stops_on_iteration_limit() {
+    let model = FakeModel {
+        responses: Mutex::new(VecDeque::from(vec![
+            ModelResponse {
+                content: r#"{"done":false,"thought":"step1","tool_calls":[],"result":null}"#
+                    .to_string(),
+                usage: TokenUsage {
+                    prompt_tokens: 1,
+                    completion_tokens: 1,
+                    total_tokens: 2,
+                },
+            },
+            ModelResponse {
+                content: r#"{"done":false,"thought":"step2","tool_calls":[],"result":null}"#
+                    .to_string(),
+                usage: TokenUsage {
+                    prompt_tokens: 1,
+                    completion_tokens: 1,
+                    total_tokens: 2,
+                },
+            },
+        ])),
+    };
+
+    let engine = AgentEngine::new(Arc::new(model), Arc::new(FakeTools), Loggers::default());
+    let output = engine
+        .run(request(
+            "never done",
+            LimitsConfig {
+                max_iterations: 2,
+                max_tokens: 100,
+                max_duration_sec: 60,
+                max_cost: None,
+            },
+        ))
+        .await;
+
+    assert_eq!(output.stop_reason, StopReason::LimitReached);
+    assert!(output.result.contains("max_iterations"));
+    assert_eq!(output.usage.iterations, 2);
+}
+
+#[tokio::test]
+async fn run_stops_on_max_tokens_limit() {
+    let model = FakeModel {
+        responses: Mutex::new(VecDeque::from(vec![ModelResponse {
+            content: r#"{"done":false,"thought":"step1","tool_calls":[],"result":null}"#
+                .to_string(),
+            usage: TokenUsage {
+                prompt_tokens: 40,
+                completion_tokens: 40,
+                total_tokens: 80,
+            },
+        }])),
+    };
+
+    let engine = AgentEngine::new(Arc::new(model), Arc::new(FakeTools), Loggers::default());
+    let output = engine
+        .run(request(
+            "never done",
+            LimitsConfig {
+                max_iterations: 10,
+                max_tokens: 50,
+                max_duration_sec: 60,
+                max_cost: None,
+            },
+        ))
+        .await;
+
+    assert_eq!(output.stop_reason, StopReason::LimitReached);
+    assert!(output.result.contains("max_tokens"));
+    assert!(output.usage.total_tokens >= 50);
+    assert_eq!(output.usage.iterations, 1);
+}
+
+#[tokio::test]
+async fn model_can_write_an_artifact_inside_home() {
+    let model = FakeModel {
+        responses: Mutex::new(VecDeque::from(vec![
+            ModelResponse {
+                content: r#"{"done":false,"thought":"write","tool_calls":[{"server":"home","tool":"write","arguments":{"path":"out/result.txt","content":"ready"}}],"result":null}"#.to_string(),
+                usage: TokenUsage::default(),
+            },
+            ModelResponse {
+                content:
+                    r#"{"done":true,"thought":"done","tool_calls":[],"result":"artifact created"}"#
+                        .to_string(),
+                usage: TokenUsage::default(),
+            },
+        ])),
+    };
+    let dir = tempfile::tempdir().expect("temp dir");
+    let composite = make_legacy_tools(dir.path()).await;
+    let tools = policy_executor_for(composite, &ResolvedAccessPolicy::legacy(), &["home.write"]);
+    let engine = AgentEngine::new(Arc::new(model), tools, Loggers::default());
+
+    let output = engine
+        .run(request(
+            "write an artifact",
+            LimitsConfig {
+                max_iterations: 3,
+                max_tokens: 100,
+                max_duration_sec: 60,
+                max_cost: None,
+            },
+        ))
+        .await;
+
+    assert_eq!(output.stop_reason, StopReason::GoalReached);
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("out/result.txt")).expect("read artifact"),
+        "ready"
+    );
+}
+
+#[tokio::test]
+async fn denied_tool_is_returned_as_tool_result_error() {
+    let model = FakeModel {
+        responses: Mutex::new(VecDeque::from(vec![
+            ModelResponse {
+                content: r#"{"done":false,"thought":"try denied","tool_calls":[{"server":"home","tool":"write","arguments":{"path":"out/x.txt","content":"no"}}],"result":null}"#.to_string(),
+                usage: TokenUsage::default(),
+            },
+            ModelResponse {
+                content: r#"{"done":true,"thought":"gave up","tool_calls":[],"result":"denied visible"}"#
+                    .to_string(),
+                usage: TokenUsage::default(),
+            },
+        ])),
+    };
+    let dir = tempfile::tempdir().expect("temp dir");
+    let composite = make_legacy_tools(dir.path()).await;
+    let tools = policy_executor_for(composite, &ResolvedAccessPolicy::legacy(), &["home.read"]);
+    let engine = AgentEngine::new(Arc::new(model), tools, Loggers::default());
+
+    let output = engine
+        .run(request(
+            "deny write",
+            LimitsConfig {
+                max_iterations: 3,
+                max_tokens: 100,
+                max_duration_sec: 60,
+                max_cost: None,
+            },
+        ))
+        .await;
+
+    assert_eq!(output.stop_reason, StopReason::GoalReached);
+    assert!(!dir.path().join("out/x.txt").exists());
+    assert_eq!(output.result, "denied visible");
+}
+
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+#[tokio::test]
+async fn model_can_home_run_via_native_sandbox() {
+    use agent_Kuibysheff::access::{
+        resolve_access_policy, AccessPolicyConfig, FilesystemPolicyConfig, HomeFsPolicyConfig,
+        RunPolicyConfig, ToolsPolicyConfig,
+    };
+
+    let runner = Arc::new(agent_Kuibysheff::sandbox::SandboxRunner::platform_default());
+    if let Err(err) = runner.probe() {
+        if std::env::var_os("REQUIRE_LINUX_SANDBOX").is_some()
+            || std::env::var_os("REQUIRE_NATIVE_SANDBOX").is_some()
+        {
+            panic!("native sandbox required but unavailable: {err}");
+        }
+        return;
+    }
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let local_exe = prepare_fixture_exe(dir.path());
+    let home_policy = home_policy_with_program("fixture", &local_exe);
+
+    let model = FakeModel {
+        responses: Mutex::new(VecDeque::from(vec![
+            ModelResponse {
+                content: r#"{"done":false,"thought":"run","tool_calls":[{"server":"home","tool":"run","arguments":{"program":"fixture","args":["echo","hello-agent-e2e"],"timeout_ms":15000}}],"result":null}"#.to_string(),
+                usage: TokenUsage::default(),
+            },
+            ModelResponse {
+                content: r#"{"done":true,"thought":"done","tool_calls":[],"result":"ran ok"}"#
+                    .to_string(),
+                usage: TokenUsage::default(),
+            },
+        ])),
+    };
+
+    let composite = make_tools_with_runner(dir.path(), home_policy, runner).await;
+
+    let access_cfg = AccessPolicyConfig {
+        tools: ToolsPolicyConfig {
+            builtins: vec!["home.run".into()],
+        },
+        filesystem: FilesystemPolicyConfig {
+            home: HomeFsPolicyConfig {
+                read: vec![".".into()],
+                write: vec![".".into()],
+            },
+            workspace: None,
+            input_roots: Vec::new(),
+        },
+        run: RunPolicyConfig {
+            programs: Vec::new(),
+            max_args: 32,
+            max_arg_chars: 4096,
+            max_output_chars: 65_536,
+            max_timeout_ms: 60_000,
+        },
+        ..AccessPolicyConfig::default()
+    };
+    let access = resolve_access_policy(Some(&access_cfg), dir.path()).expect("access policy");
+    let tools = policy_executor_for(composite, &access, &["home.run"]);
+    let engine = AgentEngine::new(Arc::new(model), tools, Loggers::default());
+
+    let output = engine
+        .run(request(
+            "run fixture",
+            LimitsConfig {
+                max_iterations: 3,
+                max_tokens: 100,
+                max_duration_sec: 60,
+                max_cost: None,
+            },
+        ))
+        .await;
+
+    assert_eq!(output.stop_reason, StopReason::GoalReached);
+    assert_eq!(output.result, "ran ok");
+}
+
+#[tokio::test]
+async fn run_retries_after_invalid_model_json() {
+    let model = FakeModel {
+        responses: Mutex::new(VecDeque::from(vec![
+            ModelResponse {
+                content: "Here is my answer in prose, not JSON.".to_string(),
+                usage: TokenUsage::default(),
+            },
+            ModelResponse {
+                content: r#"{"done":true,"thought":"fixed","tool_calls":[],"result":"recovered"}"#
+                    .to_string(),
+                usage: TokenUsage::default(),
+            },
+        ])),
+    };
+
+    let engine = AgentEngine::new(Arc::new(model), Arc::new(FakeTools), Loggers::default());
+    let output = engine
+        .run(request(
+            "finish",
+            LimitsConfig {
+                max_iterations: 3,
+                max_tokens: 100,
+                max_duration_sec: 60,
+                max_cost: None,
+            },
+        ))
+        .await;
+
+    assert_eq!(output.stop_reason, StopReason::GoalReached);
+    assert_eq!(output.result, "recovered");
+    assert_eq!(output.usage.iterations, 2);
+}
+
+#[tokio::test]
+async fn run_saves_full_chat_history_when_enabled() {
+    let model = FakeModel {
+        responses: Mutex::new(VecDeque::from(vec![ModelResponse {
+            content: r#"{"done":true,"thought":"done","tool_calls":[],"result":"saved"}"#
+                .to_string(),
+            usage: TokenUsage {
+                prompt_tokens: 2,
+                completion_tokens: 1,
+                total_tokens: 3,
+            },
+        }])),
+    };
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let loggers = Loggers::from_config(&LoggingConfig {
+        enable_ai_log: false,
+        enable_mcp_log: false,
+        enable_chat_history: true,
+        output_dir: Some(dir.path().to_path_buf()),
+        sink: LogSinkConfig::default(),
+        ..Default::default()
+    })
+    .await
+    .expect("loggers");
+
+    let engine = AgentEngine::new(Arc::new(model), Arc::new(FakeTools), loggers);
+    let output = engine
+        .run(request(
+            "save chat",
+            LimitsConfig {
+                max_iterations: 3,
+                max_tokens: 100,
+                max_duration_sec: 60,
+                max_cost: None,
+            },
+        ))
+        .await;
+
+    let chat_log = output.logs.chat_log.expect("chat log path");
+    let contents = std::fs::read_to_string(&chat_log).expect("chat history file");
+    assert!(contents.contains("\"role\": \"system\""));
+    assert!(contents.contains("\"role\": \"assistant\""));
+    assert!(contents.contains("saved"));
+}
+
+#[tokio::test]
+async fn run_can_continue_from_saved_chat_history() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let loggers = Loggers::from_config(&LoggingConfig {
+        enable_ai_log: false,
+        enable_mcp_log: false,
+        enable_chat_history: true,
+        output_dir: Some(dir.path().to_path_buf()),
+        sink: LogSinkConfig::default(),
+        ..Default::default()
+    })
+    .await
+    .expect("loggers");
+
+    let first = FakeModel {
+        responses: Mutex::new(VecDeque::from(vec![ModelResponse {
+            content: r#"{"done":false,"thought":"mid","tool_calls":[],"result":null}"#.to_string(),
+            usage: TokenUsage {
+                prompt_tokens: 2,
+                completion_tokens: 1,
+                total_tokens: 3,
+            },
+        }])),
+    };
+    let first_output = AgentEngine::new(Arc::new(first), Arc::new(FakeTools), loggers)
+        .run(request(
+            "save chat",
+            LimitsConfig {
+                max_iterations: 1,
+                max_tokens: 100,
+                max_duration_sec: 60,
+                max_cost: None,
+            },
+        ))
+        .await;
+    assert_eq!(first_output.stop_reason, StopReason::LimitReached);
+    let chat_log = first_output.logs.chat_log.expect("chat log path");
+    let record: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&chat_log).expect("read history"))
+            .expect("json");
+    let messages: Vec<ChatMessage> =
+        serde_json::from_value(record["messages"].clone()).expect("messages");
+
+    let second = FakeModel {
+        responses: Mutex::new(VecDeque::from(vec![ModelResponse {
+            content: r#"{"done":true,"thought":"ok","tool_calls":[],"result":"continued"}"#
+                .to_string(),
+            usage: TokenUsage {
+                prompt_tokens: 2,
+                completion_tokens: 1,
+                total_tokens: 3,
+            },
+        }])),
+    };
+    let mut resume = request(
+        "",
+        LimitsConfig {
+            max_iterations: 3,
+            max_tokens: 100,
+            max_duration_sec: 60,
+            max_cost: None,
+        },
+    );
+    resume.resume_messages = Some(messages);
+    let continued = AgentEngine::new(Arc::new(second), Arc::new(FakeTools), Loggers::default())
+        .run(resume)
+        .await;
+    assert_eq!(continued.stop_reason, StopReason::GoalReached);
+    assert_eq!(continued.result, "continued");
+}

@@ -1,0 +1,336 @@
+# Architecture of agent_Kuibysheff
+
+`agent_Kuibysheff` is a minimal, reliable CLI agent worker written in Rust. It is designed to be invoked by an external orchestrator, run a single task inside an isolated sandbox, and emit exactly one JSON result on stdout. This document describes the high-level architecture, module responsibilities, and security boundaries.
+
+## Goals
+
+- **Worker, not orchestrator**: the CLI does not modify a target repository directly; it writes deliverables into a caller-provided `--home` workspace.
+- **Fail-closed security**: a required `access` policy denies everything that is not explicitly allowed (tools, paths, programs, env vars). Permissive pre-0.2 behavior is only available via explicit `access: { mode: legacy }`.
+- **OS-level sandboxing**: `home.run` payloads execute inside Linux namespaces or a Windows AppContainer with no network.
+- **Composability**: trait-based layering allows providers, tool executors, and sandbox backends to be swapped or tested independently.
+- **Single JSON contract**: regardless of success or failure, `run` prints one `RunOutput` JSON document; `stop_reason: error` also exits non-zero.
+
+## Workspace layout
+
+The repository is a Cargo workspace with four crates:
+
+| Crate | Path | Role |
+|-------|------|------|
+| `agent_Kuibysheff` | repository root | Main library and `kbshff` CLI binary. Forbids `unsafe_code` at the lint level. |
+| `kbshff-studio` | `crates/kbshff-studio` | Browser studio. Spawns `kbshff` and does not link the agent library. |
+| `sandbox-linux` | `crates/sandbox-linux` | Linux namespace sandbox with `libc` FFI. Contains all Linux-specific `unsafe`. |
+| `sandbox-windows` | `crates/sandbox-windows` | Windows AppContainer sandbox with `windows-sys` FFI. Contains all Windows-specific `unsafe`. |
+
+```mermaid
+flowchart TD
+    subgraph workspace [Cargo workspace]
+        STUDIO[kbshff-studio]
+        AGENT[agent_Kuibysheff]
+        LX[sandbox-linux]
+        WX[sandbox-windows]
+    end
+
+    STUDIO -->|subprocess| AGENT
+    AGENT -->|always| LX
+    AGENT -->|cfg(windows)| WX
+```
+
+On non-Linux targets `sandbox-linux` compiles to a stub that always returns `Unavailable`. On non-Windows targets `sandbox-windows` is not a dependency at all. The agent crate selects the real backend via `#[cfg]` in `src/sandbox/native.rs`.
+
+## High-level data flow
+
+A run is bootstrapped from CLI arguments, config files, and settings. The resulting policy, tools, provider, and limits are passed into `AgentEngine`, which runs the iterative LLM loop until the goal is reached or a limit is hit. Finally a `RunOutput` JSON object is printed.
+
+```mermaid
+flowchart TD
+    subgraph inputs [Inputs]
+        CLI[Cli Commands]
+        CFG[Config YAML/JSON]
+        SET[settings_dir]
+        FILES[--files]
+        HOME[--home]
+    end
+
+    CLI -->|overrides| CONFIG[config.rs]
+    CFG --> CONFIG
+    SET -->|master/skills/rules| SETTINGS[settings.rs]
+    FILES -->|InputFilesPolicy| CONTEXT[context.rs]
+    HOME -->|HomeFsPolicy| HOMEFS[tools/fs_home.rs]
+
+    CONFIG -->|access policy| ACCESS[access/]
+    ACCESS -->|EffectiveToolPolicy| POLICY[tools/mod.rs PolicyToolExecutor]
+    SETTINGS -->|skills allowlist| SKILLS[skills/dsl.rs]
+    SKILLS --> POLICY
+    CONFIG -->|MCP servers| MCP[mcp/]
+    MCP -->|discovered tools| POLICY
+    CONFIG -->|ordered event bindings| EVENTMCP[event_mcp/]
+    MCP -->|standard tools/call| EVENTMCP
+
+    HOMEFS -->|sandbox| SANDBOX[sandbox/]
+    SANDBOX -->|platform backend| NATIVE[sandbox/native.rs]
+    NATIVE -->|Linux| LX
+    NATIVE -->|Windows| WX
+
+    CONFIG -->|provider| PROVIDER[provider/openai_compat.rs]
+    POLICY -->|ToolExecutor| AGENT[agent/loop]
+    PROVIDER -->|ModelClient| AGENT
+    EVENTMCP -->|PipelineEvents| AGENT
+    CONTEXT --> AGENT
+
+    AGENT -->|RunOutput| OUTPUT[output.rs]
+    OUTPUT -->|JSON stdout| ORCH[External orchestrator]
+```
+
+## Module responsibilities
+
+### Bootstrap and orchestration
+
+- `src/main.rs` — thin binary entry: calls `sandbox_linux::try_run_helper()` before Tokio, then `app::run()`.
+- `src/app.rs` — CLI composition root (crate-facing, not a stable library facade). Loads dotenv, parses subcommands, and for `run` / `acp` / `a2a` starts Tokio and wires all layers. Management commands (`init`, `check`, …) print human text and exit codes; only `run` emits `RunOutput` JSON. `acp` speaks ACP JSON-RPC on stdio; `a2a` serves A2A 1.0 over HTTP.
+- `src/cli/` — `clap` subcommands (`pub(crate)`): `run` / `acp` / `a2a` (`--project-root`,
+  `--agent`, optional `--home`), `init`, `check`, `config` (CRUD + import), `agent`,
+  `mcp`, and `ui` (executes `kbshff-studio` when that binary is installed).
+- `src/commands/` — management command implementations (`pub(crate)`: `init` scaffold, `check` resource probes). Templates for `init` live under `src/templates/agent_init/` and are embedded via `include_str!`.
+- `src/acp/` — Agent Client Protocol stdio server (`session/new`, `session/prompt`, `session/cancel`, streaming `session/update`). Maps `AgentEngine` events onto ACP schema; does not implement AHP.
+- `src/a2a/` — Agent-to-Agent (A2A) 1.0 HTTP server via official `a2a-lf` / `a2a-server-lf` SDK (`AgentExecutor` → `run_agent_prompt`, Agent Card from profile, JSON-RPC + REST, optional Bearer).
+- `src/config.rs` — loads and validates YAML/JSON runtime config (`provider` including optional `provider.history`, `mcp`, `limits`, `logging`, required `access`). Embeds access DTOs owned by `access::config`, maps `AccessError` → `ConfigError`, applies CLI overrides, and resolves host paths relative to the config file directory.
+- `src/settings.rs` — loads the settings directory: `master_prompt.md`, `skills.dsl`, optional `rules.md`, and optional `skills/<name>/` packages.
+- `src/context.rs` — reads `--files` inputs, applies `InputFilesPolicy`, truncates to a char budget, and builds the context string injected into the user message.
+
+### Agent core
+
+- `src/agent/loop/` — `AgentEngine` (`engine`) runs the iterative LLM loop: sends messages to the provider, prices every physical attempt, parses the model's JSON directive (`directive`), dispatches tool calls, collects results, enforces iteration/token/cost/duration limits, prunes message history using `provider.history` (`history`), emits optional `AgentEvent` progress (`events`), and returns `RunOutput`.
+- `src/agent/events.rs` — `AgentEvent` / `AgentEventTx` progress sink used by ACP streaming. CLI `run` leaves it no-op unless `--progress stderr` is set, in which case events are NDJSON lines on stderr. Stdout stays one `RunOutput`.
+- `src/limits.rs` — `LimitsConfig` and `RunMetrics` track iterations, tokens, optional exact monetary budget, and elapsed time.
+- `src/billing/` — exact decimal money, normalized billable meters, per-attempt ledger, resolver chain, versioned local catalog, and optional host-owned MCP calculator.
+- `src/output.rs` — `RunOutput` schema: `run_id`, `result`, token/per-request cost `usage`, `stop_reason`, `logs`.
+
+### IDE and bridge protocol (ACP)
+
+ACP over stdio is the shared integration boundary for IDE hosts and for external
+messenger/mail bridges. VS Code owns the Agent Host Protocol (AHP) sessions
+server; Kuibysheff plugs in as an ACP agent. Bridges spawn the same `acp`
+subcommand with three separate pipes:
+
+```text
+Clients ←AHP→ VS Code Agent Host ←ACP stdio→ kbshff acp
+Messenger/Mail API ←→ Bridge ←ACP stdin/stdout (+ stderr drain)→ kbshff acp
+```
+
+`src/acp/` handles initialize / session lifecycle / prompt turns and forwards
+engine events as `session/update` notifications. Access policy, sandbox, and MCP
+client behavior match the `run` worker. `stdout` stays ACP-only; `stderr` and
+file sinks hold diagnostics. `init_tracing` is idempotent for repeated prompts
+in one process. Session prompts do not retain prior-turn chat history — bridges
+must supply context themselves. Messenger/email credentials are never part of
+this crate.
+
+### Peer protocol (A2A)
+
+`kbshff a2a` exposes the same worker over [A2A 1.0](https://a2a-protocol.org/latest/specification/)
+HTTP using the official SDK routers (`/.well-known/agent-card.json`,
+`/jsonrpc`, `/rest`). `src/a2a/executor.rs` implements `AgentExecutor`; task
+store and streaming stay in `a2a-server-lf`. Default bind is loopback;
+optional `--token-env` adds Bearer on RPC/REST. Outbound A2A client and gRPC
+are not implemented.
+
+### Tools and access policy
+
+- `src/tools/mod.rs` — `CompositeToolExecutor` routes built-in `home`/`local_tools` calls and falls through to MCP; `PolicyToolExecutor` wraps it and enforces `EffectiveToolPolicy`.
+- `src/tools/fs_home.rs` — built-in `home.*` tools (list, read, write, run). Enforces `HomeFsPolicy` and runs `home.run` through the sandbox runner.
+- `src/tools/local_tools.rs` — built-in `local_tools.*` tools (search_docs, read_file) for repository research. Enforces `WorkspaceFsPolicy`.
+- `src/access/config.rs` — raw YAML/JSON access DTOs (`AccessPolicyConfig` and nested types); no dependency on `crate::config`.
+- `src/access/mod.rs` — validates/resolves DTOs into `ResolvedAccessPolicy` (`TryFrom<AccessResolveInput>`), plus `EffectiveToolPolicy`, `QualifiedTool`, `ProgramAlias`, strict vs explicit `access.mode: legacy`.
+- `src/access/paths.rs` — path grant logic: `RelativeGrant`, `PathGrantScope`, `HomeFsPolicy`, `WorkspaceFsPolicy`, `InputFilesPolicy`.
+- `src/skills/dsl.rs` — parses `skills.dsl` and builds the skills allowlist and prompt catalog.
+- `src/skills/package.rs` — indexes skill packages. For a Kuibysheff profile the
+  preferred root is `.kuibysheff/runtime/skills/{id}/`; missing runtime falls
+  back to `protected/agents/{id}/skills`; when both exist, runtime wins. A
+  symlink or non-directory at the runtime path fails load. Symlinks and paths
+  that leave a skill folder are rejected.
+- `src/tools/profile_skills.rs` — `profile.list_skill` and `profile.read_skill`
+  read that index. Scripts are not executed from the package tree; sandboxed
+  `home.run` can read `runtime/skills/` without a `protected/` grant.
+
+### MCP and provider
+
+- `src/mcp/mod.rs` — stable MCP facade (`McpRegistry`, `McpError`); re-exports `ToolExecutor`.
+- `src/mcp/stdio_client.rs` — MCP over stdio (`pub(crate)` module; `McpRegistry` re-exported): server lifecycle, `tools/list`, `tools/call`, JSON-RPC actor, stderr drain, JSONL logging.
+- `src/mcp/http_client.rs` — MCP over Streamable HTTP (`pub(crate)`).
+- `src/mcp/oauth.rs` / `sse.rs` — OAuth and SSE parsing (`pub(crate)`).
+- `src/event_mcp/` — ordered synchronous middleware over standard MCP `tools/call`. Explicit
+  event bindings are compiled after tool discovery and run independently from model-selected tool
+  policy. The MVP exposes `context.before_model`, `model.after_response`, and
+  `run.before_output`; see `docs/EVENT_MCP.md` for the versioned envelope and chain semantics.
+- `src/provider/openai_compat.rs` — OpenAI-compatible `/chat/completions` client with retries and accounting for body/header cost, cache/reasoning meters, model/tier, request IDs, and failed attempts (`pub(crate)`).
+- `src/provider/mod.rs` — `ModelClient` trait and shared provider types; the default `complete_accounted` method preserves compatibility with existing clients.
+- `src/lib.rs` — curated public API; see crate rustdoc for the stable vs `pub(crate)` split.
+
+### Logging
+
+- `src/logging/mod.rs` — initializes `tracing` (idempotent for the same log directory in a long-lived ACP process), creates `Loggers` (AI/MCP/system/chat sinks).
+- `src/logging/sink.rs` — async JSONL file sink with a background writer task.
+- `src/logging/paths.rs` — resolves the log base directory.
+- `src/logging/chat_history.rs` — persists/loads the full chat transcript JSON
+  (`--save-chat-history` / `--continue-from`).
+
+### Sandbox
+
+- `src/sandbox/mod.rs` — `SandboxBackend` trait, `SandboxSpec`, `SandboxRunner`, `UnavailableBackend`; `MockBackend` is `pub(crate)`.
+- `src/sandbox/native.rs` — platform adapters that run the Linux/Windows sandbox backends inside `tokio::task::spawn_blocking`.
+- `crates/sandbox-linux` — Linux implementation: re-exec helper, `clone3` namespaces, user/group maps, pivot_root, bind mounts, capability drop, seccomp, PID1 supervision.
+- `crates/sandbox-windows` — Windows implementation: AppContainer profile, temporary ACL grants, Job Object, suspended process launch, token verification, network isolation check.
+
+## Trait-based layering
+
+The agent crate is built around object-safe traits, all wrapped in `Arc<dyn ...>` for testability and composition:
+
+| Trait | Responsibility | Implementations |
+|-------|--------------|-----------------|
+| `ModelClient` | Send chat messages to the LLM and return a completion. | `OpenAiCompatClient` |
+| `ToolExecutor` | Dispatch a tool call by `server` and `tool` name and return a JSON result. | `CompositeToolExecutor`, `PolicyToolExecutor`, `McpRegistry` |
+| `PipelineEvents` | Transform versioned payloads through ordered Event-MCP chains. | `EventMcpDispatcher`, `NoopPipelineEvents` |
+| `CostResolver` | Resolve one provider attempt to exact/estimated money or an explicit unpriced reason. | provider-reported, local catalog, optional MCP, unavailable placeholder |
+| `SandboxBackend` | Run a single payload inside the OS sandbox and return stdout/stderr/exit. | `NativeLinuxBackend`, `NativeWindowsBackend`, `UnavailableBackend`, `MockBackend` |
+
+```mermaid
+flowchart LR
+    subgraph traits [Traits]
+        MC[ModelClient]
+        TE[ToolExecutor]
+        PI[PipelineEvents]
+        CR[CostResolver]
+        SB[SandboxBackend]
+    end
+
+    subgraph impls [Implementations]
+        OC[OpenAiCompatClient]
+        CE[CompositeToolExecutor]
+        PE[PolicyToolExecutor]
+        MR[McpRegistry]
+        EM[EventMcpDispatcher]
+        NE[NoopPipelineEvents]
+        PR[ProviderReportedResolver]
+        PC[CatalogCostResolver]
+        PM[McpCostResolver]
+        NL[NativeLinuxBackend]
+        NW[NativeWindowsBackend]
+        UB[UnavailableBackend]
+    end
+
+    MC --> OC
+    TE --> CE
+    TE --> PE
+    TE --> MR
+    PI --> EM
+    PI --> NE
+    CR --> PR
+    CR --> PC
+    CR --> PM
+    SB --> NL
+    SB --> NW
+    SB --> UB
+```
+
+## Sandbox boundary
+
+All `unsafe` code is isolated in the two sandbox crates. The root crate is compiled with `unsafe_code = "forbid"`, so the agent can never perform raw pointer or FFI operations directly. The sandbox boundary is one-way: the agent builds a `SandboxSpec` and asks the platform backend to run it; the backend returns a `SandboxOutput`.
+
+```mermaid
+flowchart TD
+    AGENT[agent_Kuibysheff crate no unsafe]
+    RUNNER[SandboxRunner src/sandbox/mod.rs]
+    NATIVE[native.rs adapters]
+
+    subgraph linux [sandbox-linux crate]
+        PARENT[parent.rs re-exec]
+        HELPER[helper.rs clone3]
+        PID1[pid1.rs mount/seccomp]
+        PAYLOAD[Linux payload]
+    end
+
+    subgraph windows [sandbox-windows crate]
+        PROFILE[profile.rs AppContainer]
+        ACL[acl.rs temporary ACL grants]
+        JOB[job.rs Job Object]
+        PROCESS[process.rs CreateProcess]
+        PAYLOADW[Windows payload]
+    end
+
+    AGENT -->|SandboxSpec| RUNNER
+    RUNNER -->|probe + validate + run| NATIVE
+    NATIVE -->|spawn_blocking| PARENT
+    PARENT --> HELPER
+    HELPER --> PID1
+    PID1 --> PAYLOAD
+    NATIVE -->|spawn_blocking| PROFILE
+    PROFILE --> ACL
+    ACL --> JOB
+    JOB --> PROCESS
+    PROCESS --> PAYLOADW
+```
+
+On Linux, the helper re-execs the current binary before Tokio is initialized, sets up namespaces, pivot_root, and seccomp, then supervises the payload. On Windows, the backend uses in-process Win32 APIs to create an AppContainer process.
+
+## Access policy and tool allowlist
+
+Canonical formula: [`CONTRACT.md` Access policy](../CONTRACT.md#access-policy-fail-closed).
+The runtime uses a layered policy:
+
+1. `access::config::AccessPolicyConfig` from YAML is validated and resolved into `ResolvedAccessPolicy` (no `config` ↔ `access` type cycle).
+2. `SkillsCatalog` parses `skills.dsl` and produces a union of `allowed_tools`.
+3. `McpRegistry` discovers all tools from configured MCP servers.
+4. `EffectiveToolPolicy::compile` builds the final allowlist:
+
+   ```text
+   KNOWN_BUILTINS = {home.list, home.read, home.write, home.run, local_tools.search_docs, local_tools.read_file, profile.list_skill, profile.read_skill}
+
+   effective_builtins = KNOWN_BUILTINS ∩ access.tools.builtins ∩ skills.allowed_tools
+   effective_mcp      = all_discovered_mcp_tools ∩ skills.allowed_tools
+   effective_tools    = effective_builtins ∪ effective_mcp
+                        ∪ {profile.list_skill, profile.read_skill}  # only when a skill folder exists
+   ```
+
+   - Built-ins require both the config allowlist and the skills allowlist.
+   - MCP tools require a skills allowlist entry; discovery alone is not enough.
+   - `profile.list_skill` and `profile.read_skill` are added when at least one
+     skill package folder is present under the effective packages root. They
+     read only that folder's index.
+   - Skill `policy` strings and `rules.md` are prompt-only guidance; they are not
+     enforced by `EffectiveToolPolicy`. Full instructions stay in `skill.md` and
+     are fetched by the model through `profile.read_skill`.
+
+5. `PolicyToolExecutor` gates every call and advertises only `effective_tools` to the model.
+
+Path grants (`home`, `workspace`, `input_roots`) are also fail-closed in strict mode: a relative path must match an allowed prefix by component. Legacy mode preserves pre-strict behavior for backwards compatibility.
+
+MCP process trust (stdio framing, child shutdown, audit vs side effect) is separate
+from this allowlist; see [architecture-review](architecture-review/README.md)
+P0 items `01`–`03` and docs sync item [`09`](architecture-review/09-sync-architecture-docs.md).
+
+## Configuration and lifecycle
+
+1. `main` calls `sandbox_linux::try_run_helper()` before Tokio.
+2. `run()` loads config, applies CLI overrides, validates, initializes tracing and loggers.
+3. Settings, skills, input files, `HomeFs`, `LocalTools`, and MCP connections are initialized.
+4. The system prompt is assembled from `master_prompt.md`, optional `rules.md`, the skills catalog (`policy`, `instructions=stored|none`, file count), and hardcoded runtime rules. Skill bodies are not inlined.
+5. `AgentEngine::run` starts the loop.
+6. On exit, `RunOutput` is serialized to pretty JSON and printed to stdout; the
+   process exits non-zero when `stop_reason` is `error`.
+
+## Key security properties
+
+- **No unsafe in the agent crate**: `unsafe_code = "forbid"` in root `Cargo.toml`.
+- **Fail-closed defaults**: strict mode denies unlisted tools, paths, and programs; sandbox probe failure prevents `home.run` if programs are configured.
+- **Literal argv execution**: `home.run` executes the program directly with the provided arguments; no shell interpretation.
+- **Bounded output**: sandboxed runs are capped by `max_output_chars` and a deadline to avoid pipe deadlocks and runaway processes.
+- **Immutable policy after startup**: `ResolvedAccessPolicy` and `EffectiveToolPolicy` are built once before the loop begins.
+
+## Further reading
+
+- [`CONTRACT.md`](../CONTRACT.md) — stable orchestrator interface and output schema.
+- [`../README.md`](../README.md) — product overview, quick start, and CLI usage.
+- [`docs/README.md`](README.md) — documentation index (billing, Event-MCP, logging, output, releases).
+- [`crates/sandbox-linux/TESTING.md`](../crates/sandbox-linux/TESTING.md) — Linux sandbox testing notes.
+- [`settings/`](../settings/) — example agent settings directory.
+- [`agent-config.example.yaml`](../agent-config.example.yaml) — example runtime config.

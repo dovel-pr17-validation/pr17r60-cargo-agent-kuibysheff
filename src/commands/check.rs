@@ -1,0 +1,813 @@
+//! Probe configured agent resources (provider, MCP, access paths, settings).
+
+use std::fmt;
+use std::io;
+use std::path::Path;
+
+use serde::Serialize;
+use thiserror::Error;
+
+use crate::access::{parse_tool_list, AccessMode, EffectiveToolPolicy};
+use crate::billing::PricingCatalog;
+use crate::cli::CheckArgs;
+use crate::config::{load_config, AppConfig, ConfigError, McpTransport};
+use crate::logging::resolve_base_dir;
+use crate::mcp::stdio_client::McpRegistry;
+use crate::project_paths::{resolve_agent_identity, AgentPathError};
+use crate::provider::openai_compat::OpenAiCompatClient;
+use crate::sandbox::SandboxRunner;
+use crate::settings::{load_settings, SettingsError};
+use crate::skills::package::catalog_from_settings;
+use crate::tool_api::ToolExecutor;
+use tokio_util::sync::CancellationToken;
+
+/// Fatal errors that prevent producing a check report.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum CheckError {
+    #[error("failed to load config: {0}")]
+    Config(#[from] ConfigError),
+    #[error(transparent)]
+    AgentPath(#[from] AgentPathError),
+    #[error("failed to start async runtime: {0}")]
+    Runtime(#[source] io::Error),
+}
+
+/// Outcome of one resource probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckStatus {
+    Ok,
+    Fail,
+    Skip,
+}
+
+impl fmt::Display for CheckStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Ok => write!(f, "ok"),
+            Self::Fail => write!(f, "fail"),
+            Self::Skip => write!(f, "skip"),
+        }
+    }
+}
+
+/// One named probe result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CheckItem {
+    pub name: String,
+    pub status: CheckStatus,
+    pub detail: String,
+}
+
+/// Aggregate report for `check`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CheckReport {
+    pub config_path: String,
+    pub items: Vec<CheckItem>,
+    /// Connected vs available resources summary for interactive tooling.
+    pub inventory: ResourceInventory,
+}
+
+/// Snapshot of configured and discovered resources.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+pub struct ResourceInventory {
+    /// Built-in tools allowed by the access policy (qualified names).
+    pub builtins_allowed: Vec<String>,
+    /// MCP servers that connected successfully with their discovered tools.
+    pub mcp_connected: Vec<McpInventory>,
+    /// MCP servers that failed to connect (name + detail).
+    pub mcp_failed: Vec<(String, String)>,
+    /// Discovered MCP tools filtered out by access/skills policy.
+    pub mcp_gated: Vec<String>,
+    /// Effective tools the agent may call (builtins ∪ allowed MCP).
+    pub tools_available: Vec<String>,
+}
+
+/// One successfully connected MCP server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct McpInventory {
+    pub name: String,
+    pub transport: String,
+    pub tools: Vec<String>,
+}
+
+impl CheckReport {
+    #[must_use]
+    pub fn all_passed(&self) -> bool {
+        self.items
+            .iter()
+            .all(|item| item.status != CheckStatus::Fail)
+    }
+
+    #[must_use]
+    pub fn passed_count(&self) -> usize {
+        self.items
+            .iter()
+            .filter(|item| item.status == CheckStatus::Ok)
+            .count()
+    }
+
+    #[must_use]
+    pub fn failed_count(&self) -> usize {
+        self.items
+            .iter()
+            .filter(|item| item.status == CheckStatus::Fail)
+            .count()
+    }
+
+    #[must_use]
+    pub fn skipped_count(&self) -> usize {
+        self.items
+            .iter()
+            .filter(|item| item.status == CheckStatus::Skip)
+            .count()
+    }
+}
+
+/// Load config and probe configured resources.
+///
+/// # Errors
+///
+/// Returns [`CheckError`] when the config cannot be loaded or the Tokio runtime
+/// cannot be started. Individual probe failures are recorded in the report.
+pub fn run(args: &CheckArgs) -> Result<CheckReport, CheckError> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(CheckError::Runtime)?;
+    runtime.block_on(run_async(args))
+}
+
+/// Async entry for hosts that already own a Tokio runtime.
+///
+/// # Errors
+///
+/// Same as [`run`].
+pub async fn run_async(args: &CheckArgs) -> Result<CheckReport, CheckError> {
+    let paths = resolve_agent_identity(&args.identity.project_root, &args.identity.agent, None)?;
+    let config_path = paths.config.clone();
+    let settings_dir = paths.settings_dir.clone();
+    let (cfg, access) = tokio::task::spawn_blocking(move || load_config(&config_path))
+        .await
+        .map_err(|err| {
+            CheckError::Runtime(io::Error::other(format!("config load task: {err}")))
+        })??;
+
+    let mut items = Vec::new();
+    items.push(CheckItem {
+        name: "config".to_string(),
+        status: CheckStatus::Ok,
+        detail: format!(
+            "loaded agent `{}` ({} MCP server(s))",
+            args.identity.agent,
+            cfg.mcp.len()
+        ),
+    });
+
+    check_provider(&cfg, args.skip_provider, &mut items).await;
+    let mut inventory = ResourceInventory {
+        builtins_allowed: access
+            .allowed_builtins()
+            .iter()
+            .map(|t| t.qualified())
+            .collect(),
+        ..Default::default()
+    };
+    check_mcp(
+        &cfg,
+        &paths.config,
+        &args.identity.project_root,
+        &args.identity.agent,
+        args.skip_mcp,
+        &mut items,
+        &mut inventory,
+    )
+    .await;
+    check_billing_catalog(&cfg, &paths.config, &mut items);
+    check_access(&access, &mut items);
+    check_sandbox(&access, args.skip_sandbox, &mut items);
+    check_logging(&cfg, &mut items);
+    check_settings(&settings_dir, &mut items);
+
+    let (skills_allowed, grant_profile_skills) = match load_settings(&settings_dir) {
+        Ok(settings) => {
+            match catalog_from_settings(&settings.skills_source, &settings.skill_packages) {
+                Ok(catalog) => (
+                    catalog.allowed_qualified_tools(),
+                    !settings.skill_packages.is_empty(),
+                ),
+                Err(_) => (Default::default(), false),
+            }
+        }
+        Err(_) => (Default::default(), false),
+    };
+    let discovered: Vec<String> = inventory
+        .mcp_connected
+        .iter()
+        .flat_map(|s| s.tools.iter().cloned())
+        .collect();
+    let mcp_parsed = parse_tool_list(discovered.iter().map(String::as_str)).unwrap_or_default();
+    let mut effective = EffectiveToolPolicy::compile(&access, &skills_allowed, mcp_parsed.clone());
+    if grant_profile_skills {
+        effective.grant_profile_skills();
+    }
+    inventory.tools_available = effective.advertised();
+    inventory.mcp_gated = mcp_parsed
+        .iter()
+        .filter(|t| !effective.allows(t))
+        .map(|t| t.qualified())
+        .collect();
+
+    Ok(CheckReport {
+        config_path: paths.config.display().to_string(),
+        items,
+        inventory,
+    })
+}
+
+async fn check_provider(cfg: &AppConfig, skip: bool, items: &mut Vec<CheckItem>) {
+    match cfg.provider.resolve_api_key() {
+        Ok(_) => {
+            let source = if cfg.provider.has_inline_api_key() {
+                "inline `provider.api_key`".to_string()
+            } else {
+                format!("env `{}`", cfg.provider.api_key_env)
+            };
+            items.push(CheckItem {
+                name: "provider.api_key".to_string(),
+                status: CheckStatus::Ok,
+                detail: format!("resolved from {source}"),
+            });
+        }
+        Err(_) => {
+            items.push(CheckItem {
+                name: "provider.api_key".to_string(),
+                status: CheckStatus::Fail,
+                detail: format!("missing inline key and env `{}`", cfg.provider.api_key_env),
+            });
+            if !skip {
+                items.push(CheckItem {
+                    name: "provider.http".to_string(),
+                    status: CheckStatus::Skip,
+                    detail: "skipped because API key is missing".to_string(),
+                });
+            }
+            return;
+        }
+    }
+
+    if skip {
+        items.push(CheckItem {
+            name: "provider.http".to_string(),
+            status: CheckStatus::Skip,
+            detail: "skipped (`--skip-provider`)".to_string(),
+        });
+        return;
+    }
+
+    match OpenAiCompatClient::new(cfg.provider.clone()) {
+        Ok(client) => match client.probe().await {
+            Ok(detail) => items.push(CheckItem {
+                name: "provider.http".to_string(),
+                status: CheckStatus::Ok,
+                detail,
+            }),
+            Err(err) => items.push(CheckItem {
+                name: "provider.http".to_string(),
+                status: CheckStatus::Fail,
+                detail: err.to_string(),
+            }),
+        },
+        Err(err) => items.push(CheckItem {
+            name: "provider.http".to_string(),
+            status: CheckStatus::Fail,
+            detail: err.to_string(),
+        }),
+    }
+}
+
+async fn check_mcp(
+    cfg: &AppConfig,
+    config_path: &Path,
+    project_root: &Path,
+    agent_id: &str,
+    skip: bool,
+    items: &mut Vec<CheckItem>,
+    inventory: &mut ResourceInventory,
+) {
+    if skip {
+        items.push(CheckItem {
+            name: "mcp".to_string(),
+            status: CheckStatus::Skip,
+            detail: "skipped (`--skip-mcp`)".to_string(),
+        });
+        return;
+    }
+
+    if cfg.mcp.is_empty() {
+        items.push(CheckItem {
+            name: "mcp".to_string(),
+            status: CheckStatus::Ok,
+            detail: "no MCP servers configured".to_string(),
+        });
+        return;
+    }
+
+    let config_dir = config_path.parent();
+    let _ = config_dir;
+    for server in &cfg.mcp {
+        let transport = match &server.transport {
+            McpTransport::Stdio(stdio) => format!("stdio `{}`", stdio.command),
+            McpTransport::Http(http) => format!("http `{}`", http.url),
+        };
+        let name = format!("mcp.{}", server.name);
+        match McpRegistry::connect_all_isolated(
+            std::slice::from_ref(server),
+            None,
+            CancellationToken::new(),
+            crate::mcp::McpIsolationContext {
+                project_root: Some(project_root.to_path_buf()),
+                agent_id: agent_id.to_string(),
+            },
+        )
+        .await
+        {
+            Ok(registry) => {
+                let tools = registry.available_tools();
+                let missing_billing_target = cfg
+                    .billing
+                    .mcp
+                    .as_ref()
+                    .filter(|binding| binding.target.starts_with(&format!("{}.", server.name)))
+                    .is_some_and(|binding| !tools.iter().any(|tool| tool == &binding.target));
+                items.push(CheckItem {
+                    name,
+                    status: if missing_billing_target {
+                        CheckStatus::Fail
+                    } else {
+                        CheckStatus::Ok
+                    },
+                    detail: if missing_billing_target {
+                        format!(
+                            "{transport}; configured billing target was not discovered ({} tool(s))",
+                            tools.len()
+                        )
+                    } else {
+                        format!("{transport}; {} tool(s)", tools.len())
+                    },
+                });
+                inventory.mcp_connected.push(McpInventory {
+                    name: server.name.clone(),
+                    transport: transport.clone(),
+                    tools,
+                });
+                registry.shutdown().await;
+            }
+            Err(err) => {
+                items.push(CheckItem {
+                    name,
+                    status: CheckStatus::Fail,
+                    detail: format!("{transport}: {err}"),
+                });
+                inventory
+                    .mcp_failed
+                    .push((server.name.clone(), format!("{transport}: {err}")));
+            }
+        }
+    }
+}
+
+fn check_billing_catalog(cfg: &AppConfig, config_path: &Path, items: &mut Vec<CheckItem>) {
+    let Some(path) = &cfg.billing.catalog_path else {
+        items.push(CheckItem {
+            name: "billing.catalog".to_string(),
+            status: CheckStatus::Skip,
+            detail: "no local pricing catalog configured".to_string(),
+        });
+        return;
+    };
+    let resolved = if path.is_absolute() {
+        path.clone()
+    } else {
+        config_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(path)
+    };
+    match PricingCatalog::load(&resolved) {
+        Ok(catalog) => items.push(CheckItem {
+            name: "billing.catalog".to_string(),
+            status: CheckStatus::Ok,
+            detail: format!(
+                "loaded `{}` version `{}` ({} rule(s))",
+                resolved.display(),
+                catalog.version,
+                catalog.rules.len()
+            ),
+        }),
+        Err(error) => items.push(CheckItem {
+            name: "billing.catalog".to_string(),
+            status: CheckStatus::Fail,
+            detail: error.to_string(),
+        }),
+    }
+}
+
+fn check_access(access: &crate::access::ResolvedAccessPolicy, items: &mut Vec<CheckItem>) {
+    match access.mode() {
+        AccessMode::Legacy => {
+            items.push(CheckItem {
+                name: "access".to_string(),
+                status: CheckStatus::Ok,
+                detail: "legacy mode (`access.mode: legacy`)".to_string(),
+            });
+        }
+        AccessMode::Strict => {
+            let mut parts = Vec::new();
+            if let Some(workspace) = access.workspace() {
+                parts.push(format!(
+                    "workspace=`{}`",
+                    workspace.root.as_path().display()
+                ));
+            }
+            if !access.input_roots().is_empty() {
+                parts.push(format!("{} input root(s)", access.input_roots().len()));
+            }
+            parts.push(format!("{} program(s)", access.programs().len()));
+            items.push(CheckItem {
+                name: "access".to_string(),
+                status: CheckStatus::Ok,
+                detail: format!("strict; {}", parts.join("; ")),
+            });
+            for program in access.programs().values() {
+                let missing: Vec<_> = program
+                    .inherit_env
+                    .iter()
+                    .filter(|key| std::env::var_os(key).is_none())
+                    .cloned()
+                    .collect();
+                if missing.is_empty() {
+                    items.push(CheckItem {
+                        name: format!("access.run.{}", program.alias),
+                        status: CheckStatus::Ok,
+                        detail: format!("executable `{}`", program.executable.as_path().display()),
+                    });
+                } else {
+                    items.push(CheckItem {
+                        name: format!("access.run.{}", program.alias),
+                        status: CheckStatus::Fail,
+                        detail: format!(
+                            "executable ok, missing inherit_env: {}",
+                            missing.join(", ")
+                        ),
+                    });
+                }
+            }
+        }
+    }
+}
+
+fn check_sandbox(
+    access: &crate::access::ResolvedAccessPolicy,
+    skip: bool,
+    items: &mut Vec<CheckItem>,
+) {
+    if access.programs().is_empty() {
+        return;
+    }
+    if skip {
+        items.push(CheckItem {
+            name: "sandbox".to_string(),
+            status: CheckStatus::Skip,
+            detail: "skipped (`--skip-sandbox`)".to_string(),
+        });
+        return;
+    }
+
+    let runner = SandboxRunner::platform_default();
+    match runner.probe() {
+        Ok(()) => items.push(CheckItem {
+            name: "sandbox".to_string(),
+            status: CheckStatus::Ok,
+            detail: "OS sandbox available".to_string(),
+        }),
+        Err(err) => items.push(CheckItem {
+            name: "sandbox".to_string(),
+            status: CheckStatus::Fail,
+            detail: err.to_string(),
+        }),
+    }
+}
+
+fn check_logging(cfg: &AppConfig, items: &mut Vec<CheckItem>) {
+    match resolve_base_dir(&cfg.logging) {
+        Ok(dir) => items.push(CheckItem {
+            name: "logging".to_string(),
+            status: CheckStatus::Ok,
+            detail: format!("base dir `{}`", dir.display()),
+        }),
+        Err(err) => items.push(CheckItem {
+            name: "logging".to_string(),
+            status: CheckStatus::Fail,
+            detail: err.to_string(),
+        }),
+    }
+}
+
+fn check_settings(settings_dir: &Path, items: &mut Vec<CheckItem>) {
+    match load_settings(settings_dir) {
+        Ok(settings) => {
+            match catalog_from_settings(&settings.skills_source, &settings.skill_packages) {
+                Ok(catalog) => {
+                    let rules = if settings.rules.trim().is_empty() {
+                        "rules.md absent/empty"
+                    } else {
+                        "rules.md present"
+                    };
+                    items.push(CheckItem {
+                        name: "settings".to_string(),
+                        status: CheckStatus::Ok,
+                        detail: format!(
+                            "`{}`; skills ok ({} allowed tool(s), {} skill folder(s)); {rules}",
+                            settings_dir.display(),
+                            catalog.allowed_qualified_tools().len(),
+                            settings.skill_packages.len()
+                        ),
+                    });
+                }
+                Err(err) => items.push(CheckItem {
+                    name: "settings".to_string(),
+                    status: CheckStatus::Fail,
+                    detail: format!("skills.dsl parse error: {err}"),
+                }),
+            }
+        }
+        Err(err) => items.push(CheckItem {
+            name: "settings".to_string(),
+            status: CheckStatus::Fail,
+            detail: match err {
+                SettingsError::ReadFile { path, source } => {
+                    format!("failed to read `{path}`: {source}")
+                }
+                SettingsError::WriteFile { path, source } => {
+                    format!("failed to write `{path}`: {source}")
+                }
+                SettingsError::EmptyFile(path) => format!("`{path}` is empty"),
+                SettingsError::InvalidSkillPackage(message) => message,
+            },
+        }),
+    }
+}
+
+/// Print a human-readable check report to stdout.
+pub fn print_report(report: &CheckReport) {
+    println!("Checking `{}`...\n", report.config_path);
+    let width = report
+        .items
+        .iter()
+        .map(|item| item.name.len())
+        .max()
+        .unwrap_or(8);
+    for item in &report.items {
+        println!(
+            "  [{:<4}] {:width$}  {}",
+            item.status,
+            item.name,
+            item.detail,
+            width = width
+        );
+    }
+    println!();
+    if report.all_passed() {
+        println!(
+            "Result: all checks passed ({} ok, {} skipped)",
+            report.passed_count(),
+            report.skipped_count()
+        );
+    } else {
+        println!(
+            "Result: {} failed, {} passed, {} skipped",
+            report.failed_count(),
+            report.passed_count(),
+            report.skipped_count()
+        );
+    }
+}
+
+/// Print connected vs available resource inventory (for the interactive wizard).
+pub fn print_inventory(inventory: &ResourceInventory) {
+    println!("\nConnected resources:");
+    if inventory.mcp_connected.is_empty() && inventory.mcp_failed.is_empty() {
+        println!("  MCP: (none configured or skipped)");
+    } else {
+        for server in &inventory.mcp_connected {
+            println!(
+                "  MCP `{}` ({}) — {} tool(s)",
+                server.name,
+                server.transport,
+                server.tools.len()
+            );
+            for tool in &server.tools {
+                println!("    - {tool}");
+            }
+        }
+        for (name, detail) in &inventory.mcp_failed {
+            println!("  MCP `{name}` — failed: {detail}");
+        }
+    }
+
+    println!("\nAvailable to the agent:");
+    if inventory.tools_available.is_empty() {
+        println!("  (no effective tools)");
+    } else {
+        for tool in &inventory.tools_available {
+            println!("  - {tool}");
+        }
+    }
+    if !inventory.mcp_gated.is_empty() {
+        println!("\nDiscovered but gated by policy/skills:");
+        for tool in &inventory.mcp_gated {
+            println!("  - {tool}");
+        }
+    }
+    if !inventory.builtins_allowed.is_empty() {
+        println!(
+            "\nAccess-policy builtins: {}",
+            inventory.builtins_allowed.join(", ")
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::AgentIdentityArgs;
+    use crate::cli::InitArgs;
+    use crate::commands::init;
+    use crate::project_paths::AGENT_CONFIG_FILE;
+    use std::fs;
+    use tempfile::tempdir;
+
+    fn scaffold_agent(project: &Path, agent: &str) {
+        init::run(&InitArgs {
+            agent_id: agent.to_string(),
+            project_root: project.to_path_buf(),
+            force: true,
+            interactive: false,
+        })
+        .expect("init");
+    }
+
+    fn check_args(project: &Path, agent: &str) -> CheckArgs {
+        CheckArgs {
+            identity: AgentIdentityArgs {
+                project_root: project.to_path_buf(),
+                agent: agent.to_string(),
+            },
+            skip_provider: true,
+            skip_mcp: true,
+            skip_sandbox: true,
+            format: crate::cli::ConfigFormat::Text,
+        }
+    }
+
+    #[test]
+    fn check_passes_for_init_profile() {
+        let dir = tempdir().expect("tempdir");
+        scaffold_agent(dir.path(), "demo");
+        // Starter config may lack a resolvable API key — skip provider probe.
+        let report = run(&check_args(dir.path(), "demo")).expect("check");
+        assert!(
+            report
+                .items
+                .iter()
+                .any(|i| i.name == "config" && i.status == CheckStatus::Ok),
+            "{report:?}"
+        );
+        assert!(
+            report
+                .items
+                .iter()
+                .any(|i| i.name == "settings" && i.status == CheckStatus::Ok),
+            "{report:?}"
+        );
+    }
+
+    #[test]
+    fn check_fails_when_api_key_missing() {
+        let dir = tempdir().expect("tempdir");
+        scaffold_agent(dir.path(), "demo");
+        let paths = resolve_agent_identity(dir.path(), "demo", None).unwrap();
+        fs::write(
+            &paths.config,
+            r#"provider:
+  base_url: "https://example.test/v1"
+  model: "test-model"
+  api_key_env: "CHECK_MISSING_KEY_UNLIKELY_SET_xyz"
+  timeout_ms: 1000
+  max_retries: 0
+  retry_base_delay_ms: 1
+
+mcp: []
+
+limits:
+  max_iterations: 1
+  max_tokens: 100
+  max_duration_sec: 10
+
+logging:
+  enable_ai_log: false
+  enable_mcp_log: false
+  enable_chat_history: false
+  sink:
+    type: file
+
+access:
+  mode: legacy
+"#,
+        )
+        .expect("write");
+        std::env::remove_var("CHECK_MISSING_KEY_UNLIKELY_SET_xyz");
+        let mut args = check_args(dir.path(), "demo");
+        args.skip_provider = true;
+        let report = run(&args).expect("check");
+        assert!(!report.all_passed());
+        assert!(report
+            .items
+            .iter()
+            .any(|i| { i.name == "provider.api_key" && i.status == CheckStatus::Fail }));
+        let _ = AGENT_CONFIG_FILE;
+    }
+
+    #[test]
+    fn check_grants_profile_tools_when_a_skill_folder_exists() {
+        let dir = tempdir().expect("tempdir");
+        scaffold_agent(dir.path(), "demo");
+        let paths = resolve_agent_identity(dir.path(), "demo", None).unwrap();
+        let _ = fs::remove_file(paths.settings_dir.join("rules.md"));
+        fs::create_dir_all(paths.settings_dir.join("skills").join("workspace")).expect("skill");
+        fs::write(
+            paths
+                .settings_dir
+                .join("skills")
+                .join("workspace")
+                .join("skill.md"),
+            "# Workspace\n",
+        )
+        .expect("body");
+        let report = run(&check_args(dir.path(), "demo")).expect("check");
+        let settings = report
+            .items
+            .iter()
+            .find(|item| item.name == "settings")
+            .expect("settings");
+        assert_eq!(settings.status, CheckStatus::Ok);
+        assert!(
+            settings.detail.contains("1 skill folder"),
+            "{}",
+            settings.detail
+        );
+        assert!(
+            settings.detail.contains("rules.md absent"),
+            "{}",
+            settings.detail
+        );
+        assert!(report
+            .inventory
+            .tools_available
+            .iter()
+            .any(|tool| tool == "profile.read_skill"));
+    }
+
+    #[test]
+    fn check_reports_invalid_skill_package_and_unreadable_dsl() {
+        let dir = tempdir().expect("tempdir");
+        scaffold_agent(dir.path(), "demo");
+        let paths = resolve_agent_identity(dir.path(), "demo", None).unwrap();
+        fs::create_dir_all(paths.settings_dir.join("skills").join("workspace")).expect("skill");
+        let report = run(&check_args(dir.path(), "demo")).expect("check");
+        let settings = report
+            .items
+            .iter()
+            .find(|item| item.name == "settings")
+            .expect("settings");
+        assert_eq!(settings.status, CheckStatus::Fail);
+        assert!(settings.detail.contains("skill.md"), "{}", settings.detail);
+
+        fs::write(paths.settings_dir.join("skills.dsl"), "not a skill\n").expect("dsl");
+        fs::remove_dir_all(paths.settings_dir.join("skills")).expect("rm skills");
+        let report = run(&check_args(dir.path(), "demo")).expect("check");
+        let settings = report
+            .items
+            .iter()
+            .find(|item| item.name == "settings")
+            .expect("settings");
+        assert_eq!(settings.status, CheckStatus::Fail);
+        assert!(
+            settings.detail.contains("parse") || settings.detail.contains("skill"),
+            "{}",
+            settings.detail
+        );
+    }
+}

@@ -1,0 +1,138 @@
+provider:
+  base_url: "https://api.openai.com/v1"
+  model: "gpt-4o-mini"
+  api_key_env: "OPENAI_API_KEY"
+  # api_key: "inline-local-key"   # optional; prefer .env for secrets
+  timeout_ms: 60000
+  max_retries: 3
+  retry_base_delay_ms: 500
+  # Context-window pruning for this model (independent of limits.max_tokens).
+  # Raise for long-context models. Rough guide: ~4 chars ≈ 1 token.
+  history:
+    max_tail_messages: 30
+    max_chars: 200000
+
+mcp: []
+# Examples:
+# mcp:
+#   - name: local
+#     transport: stdio
+#     command: "npx"
+#     args: ["-y", "mcp-server"]
+#     timeout_ms: 20000
+#   - name: remote
+#     transport: http
+#     url: "https://mcp.example.com/mcp"
+#     headers:
+#       Authorization: "Bearer REPLACE_WITH_STATIC_TOKEN"   # or use auth: below for OAuth 2.1
+#     timeout_ms: 20000
+#     auth:
+#       client_id: "agent-kuibysheff"
+#       client_secret_env: "MCP_REMOTE_CLIENT_SECRET"
+#       scopes: ["mcp:tools"]
+#       redirect_port: 0
+#       token_store: "~/.agent-kuibysheff/mcp-tokens/remote.json"
+
+# Optional ordered MCP middleware. Each target must be exposed by one of the MCP servers above.
+# The output of one handler becomes the input of the next handler in list order.
+event_mcp:
+  events: {}
+# Example (replace the empty mapping above):
+# event_mcp:
+#   events:
+#     context.before_model:
+#       handlers:
+#         - id: redact-secrets
+#           target: local.redact
+#           timeout_ms: 3000
+#           on_error: abort
+#         - id: compact-history
+#           target: remote.compact
+#           timeout_ms: 5000
+#           on_error: continue
+
+billing:
+  provider_id: "openai"
+  currency: "USD"
+  source_order: ["provider_reported", "mcp", "catalog"]
+  provider_reported:
+    # Required before a unit-less `usage.cost` or response-cost header can be aggregated.
+    unit: "USD"
+    json_pointers: ["/usage/cost", "/usage/response_cost/total_cost"]
+    headers: ["x-litellm-response-cost"]
+  # catalog_path: "./pricing.yaml"  # versioned local fallback; relative to this config
+  # Optional dedicated MCP server/tool from `mcp:` above. Its connection is fail-soft
+  # and the server is not exposed to the model or Event-MCP.
+  # mcp:
+  #   target: "pricing.calculate_cost"
+  #   timeout_ms: 5000
+  on_unpriced: continue
+
+limits:
+  max_iterations: 10
+  max_tokens: 15000
+  max_duration_sec: 120
+  # max_cost: { amount: "1.00", currency: "USD" }
+
+logging:
+  enable_ai_log: true
+  enable_mcp_log: true
+  enable_chat_history: false
+  # Scrub AI/MCP JSONL audit payloads (not chat_history / agent.trace.log).
+  # audit_redaction:
+  #   enabled: true          # default; set false for legacy full payloads
+  #   max_string_chars: 4096
+  #   extra_sensitive_keys: []
+  # Optional legacy override. When omitted, logs go to ~/.agent-kuibysheff/logs.
+  # output_dir: "./logs"
+  sink:
+    type: file
+    # path: "./custom-logs"
+
+# Required capability policy (fail-closed). Everything not listed is denied.
+# Escape hatch for permissive home/workspace/input semantics (hides home.run):
+#   access:
+#     mode: legacy
+#
+# Network is not configured here:
+# - provider.base_url is the only HTTP origin the agent process may call for the model API
+# - each mcp entry is a trusted capability (stdio subprocess or Streamable HTTP URL / OAuth)
+# - home.run payloads always run with no network (OS sandbox)
+#
+# Relative host paths under filesystem / run resolve against this file's directory.
+access:
+  tools:
+    builtins:
+      - home.list
+      - home.read
+      - home.write
+      - home.run
+      - local_tools.search_docs
+      - local_tools.read_file
+
+  filesystem:
+    home:
+      # Relative prefixes inside CLI --home
+      read: ["in", "out"]
+      write: ["out"]
+    # Optional workspace research root for local_tools.*
+    # workspace:
+    #   root: "."
+    #   read: ["src", "docs", "Cargo.toml"]
+    # Host dirs allowed for --files (must exist at startup)
+    # input_roots: ["./inputs"]
+
+  run:
+    # Empty programs => home.run cannot execute anything even if the tool is allowed.
+    programs: []
+    # Example program alias (uncomment and adjust paths for your host):
+    # programs:
+    #   - name: python
+    #     executable: "python"   # or absolute path to interpreter
+    #     runtime_read_roots: ["REQUIRED_PYTHON_ROOT"]    # interpreter install / libs
+    #     inherit_env: ["SYSTEMROOT"]             # Windows; Linux often needs none
+    #     allow_children: false
+    max_args: 32
+    max_arg_chars: 4096
+    max_output_chars: 200000
+    max_timeout_ms: 120000

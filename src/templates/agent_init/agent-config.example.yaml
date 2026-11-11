@@ -1,0 +1,61 @@
+provider:
+  base_url: "https://api.openai.com/v1"
+  model: "gpt-4o-mini"
+  api_key_env: "OPENAI_API_KEY"
+  timeout_ms: 60000
+  max_retries: 3
+  retry_base_delay_ms: 500
+  # Context-window pruning for this model (independent of limits.max_tokens).
+  # Raise for long-context models. Rough guide: ~4 chars ≈ 1 token.
+  history:
+    max_tail_messages: 30
+    max_chars: 200000
+
+mcp: []
+# Add MCP servers with a future `add-mcp` command, or edit this list by hand:
+# mcp:
+#   - name: example
+#     transport: stdio
+#     command: "npx"
+#     args: ["-y", "mcp-server"]
+#     timeout_ms: 20000
+
+billing:
+  provider_id: "openai"
+  currency: "USD"
+  source_order: ["provider_reported", "mcp", "catalog"]
+  provider_reported:
+    unit: "USD"
+    json_pointers: ["/usage/cost", "/usage/response_cost/total_cost"]
+    headers: ["x-litellm-response-cost"]
+  # catalog_path: "./pricing.yaml"
+  # mcp: { target: "pricing.calculate_cost", timeout_ms: 5000 }
+  on_unpriced: continue
+
+limits:
+  max_iterations: 10
+  max_tokens: 15000
+  max_duration_sec: 120
+  # max_cost: { amount: "1.00", currency: "USD" }
+
+logging:
+  enable_ai_log: true
+  enable_mcp_log: true
+  enable_chat_history: false
+  sink:
+    type: file
+
+# Required capability policy (fail-closed). Everything not listed is denied.
+# Escape hatch for permissive FS (hides home.run):
+#   access:
+#     mode: legacy
+access:
+  tools:
+    builtins:
+      - home.list
+      - home.read
+      - home.write
+  filesystem:
+    home:
+      read: ["in", "out"]
+      write: ["out"]
